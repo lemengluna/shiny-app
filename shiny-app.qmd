@@ -1,0 +1,186 @@
+---
+title: "Greeting Behavior as Music"
+format: html
+---
+
+### Welcome to the Lemur Greeting Soundboard!
+
+In my data visualization project, I transformed Verreaux’s sifakas’ greeting interactions into personalized ringtones. In this shiny app project, I will build the interface for selecting and playing each individual's ringtone while displaying the sound waves of the file.
+
+### Library packages and load in data
+
+```{r}
+library(dplyr)
+library(readxl)
+library(stringr)
+library(tuneR)
+library(shiny)
+library(seewave)
+library(base64enc)
+```
+
+### Run the codes for data visualization to get files of ringtones
+
+```{r}
+greeting <- read_xlsx("greet_adult.xlsx")
+
+set.seed(42) 
+sampled_ids <- greeting %>%
+  distinct(Initiator_Sex, Initiator) %>%
+  group_by(Initiator_Sex) %>% 
+  sample_n(size = 5) %>%
+  pull(Initiator)
+# I filter 5 males and 5 females
+
+df_subset <- greeting %>%
+  filter(Initiator %in% sampled_ids)
+
+df_subset <- df_subset %>%
+  mutate(
+    Context_group_new = case_when(
+      grepl("feed|food", Context, ignore.case = TRUE) ~ "Feeding",
+      Context %in% c("Affiliation", "Play") ~ "Affiliative",
+      Context %in% c("Aggression", "Submissive") ~ "Agonistic",
+      Context %in% c("Forage", "Lick") ~ "Feeding",
+      Context %in% c("Rest", "Autogroom", "Scan") ~ "Resting",
+      Context %in% c("Travel") ~ "Traveling",
+      TRUE ~ "Others"
+    )
+  )
+
+df_subset <- df_subset %>%
+  mutate(
+    receiver_id = as.factor(Receiver),
+    freq = 300 + 50 * as.numeric(receiver_id),
+    dur = case_when(
+      Context_group_new == "Affiliative" ~ 1.0,
+      Context_group_new == "Feeding" ~ 0.8,
+      Context_group_new == "Traveling" ~ 0.6,
+      Context_group_new == "Resting" ~ 0.4,
+      Context_group_new == "Agonistic" ~ 0.2,
+      TRUE ~ 0.1
+    )
+  )
+#############
+sampling_rate <- 44100
+dir.create("www", showWarnings = FALSE)
+
+# function for generating a mute with a specified sample length
+silenceWave <- function(n, samp.rate = 44100, bit = 16) {
+  Wave(left = rep(0, n), samp.rate = samp.rate, bit = bit)
+}
+############
+generate_note <- function(freq, duration, amp = 10000) {
+  t <- seq(0, duration, by = 1/sampling_rate)
+  Wave(left = amp * sin(2 * pi * freq * t), samp.rate = sampling_rate, bit = 16)
+}
+
+generate_beat <- function(freq, duration = 0.15, amp = 6000, decay = 8) {
+  t <- seq(0, duration, by = 1/sampling_rate)
+  waveform <- amp * sin(2 * pi * freq * t) * exp(-decay * t)
+  Wave(left = waveform, samp.rate = sampling_rate, bit = 16)
+}
+
+generate_beat_track <- function(total_duration, interval, freq) {
+  n_beats <- floor(total_duration / interval)
+  beat_wave <- NULL
+  for (i in 1:n_beats) {
+    beat <- generate_beat(freq = freq)
+    silence_len <- round((interval - 0.15) * sampling_rate)
+    beat <- bind(beat, silenceWave(silence_len, samp.rate = sampling_rate, bit = 16))
+    beat_wave <- if (is.null(beat_wave)) beat else bind(beat_wave, beat)
+  }
+  beat_wave
+}
+#############
+initiators <- unique(df_subset$Initiator)
+
+for (lemur in initiators) {
+  notes <- df_subset %>% filter(Initiator == lemur)
+  if (nrow(notes) == 0) next
+
+  # melody
+  melody <- NULL
+  for (i in 1:nrow(notes)) {
+    note <- generate_note(notes$freq[i], notes$dur[i])
+    melody <- if (is.null(melody)) note else bind(melody, note)
+  }
+
+  # drum
+  sex <- unique(notes$Initiator_Sex)
+  interval <- if (sex == "M") 0.5 else 0.4
+  beat_freq <- if (sex == "M") 180 else 500
+  total_duration <- sum(notes$dur)
+
+  beat_track <- generate_beat_track(total_duration, interval, beat_freq)
+
+  # merge
+  len <- min(length(melody@left), length(beat_track@left))
+  melody@left <- melody@left[1:len]
+  beat_track@left <- beat_track@left[1:len]
+  mix <- melody
+  mix@left <- melody@left + beat_track@left
+
+  # save file
+  file_name <- paste0("www/", lemur, "_ringtone.wav")
+  writeWave(mix, file_name)
+}
+```
+
+For explanations on the code above, please see my data visualization project.
+
+### Shiny app for selecting and listening to (while looking at) one lemur's ringtone
+
+```{r}
+lemur_files <- list.files("www", pattern = "_ringtone\\.wav$", full.names = TRUE)
+lemur_names <- gsub("_ringtone\\.wav$", "", basename(lemur_files))
+
+base64_audio <- function(path) {
+  bytes <- readBin(path, "raw", file.info(path)$size)
+  encoded <- base64enc::base64encode(bytes)
+  paste0("data:audio/wav;base64,", encoded)
+} ##ensures that the audio will play reliably across browsers (the audio files were not playable using original files)
+
+#Define the UI
+ui <- fluidPage(
+  titlePanel("Lemur Ringtone Explorer"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("lemur", "Choose a lemur:", choices = lemur_names),
+      uiOutput("audio_ui")
+    ),
+    
+    mainPanel(
+      plotOutput("waveplot")
+    )
+  )
+)
+
+#Define the server
+server <- function(input, output, session) {
+  output$audio_ui <- renderUI({
+    req(input$lemur)
+    file_path <- file.path("www", paste0(input$lemur, "_ringtone.wav"))
+    encoded_audio <- base64_audio(file_path)
+    
+    tags$audio(
+      controls = TRUE,
+      src = encoded_audio,
+      type = "audio/wav"
+    )
+  })
+  
+   output$waveplot <- renderPlot({
+    req(input$lemur)
+    file_path <- file.path("www", paste0(input$lemur, "_ringtone.wav"))
+    wave <- readWave(file_path)
+    oscillo(wave)
+    title(main = paste("Waveform of", input$lemur), colwave = "gray30")
+  })
+}
+
+# Run the app ----
+shinyApp(ui = ui, server = server)
+
+```
